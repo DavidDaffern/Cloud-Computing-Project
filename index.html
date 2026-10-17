@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudVault | File Storage</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="container">
+    <h1>CloudVault</h1>
+    <p>Your files, stored in the cloud.</p>
+
+    <section class="panel">
+      <h2>Upload a file</h2>
+      <input type="file" id="fileInput">
+      <button id="uploadButton">Upload File</button>
+      <p id="status" role="status">Ready.</p>
+    </section>
+
+    <section class="panel">
+      <div class="heading">
+        <h2>Your files</h2>
+        <button id="refreshButton">Refresh</button>
+      </div>
+      <ul id="fileList"></ul>
+    </section>
+
+    <p class="note">Course project prototype. Do not upload sensitive files.</p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
