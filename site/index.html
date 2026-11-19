@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Private File Locker</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="config.js"></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Private File Locker</h1>
+    <p id="msg" role="status"></p>
+
+    <section id="auth">
+      <form id="signin">
+        <h2>Sign in</h2>
+        <label>Email <input type="email" id="si-email" autocomplete="username" required></label>
+        <label>Password <input type="password" id="si-pass" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+        <p><a href="#" id="to-signup">Create an account</a></p>
+      </form>
+
+      <form id="signup" hidden>
+        <h2>Create account</h2>
+        <label>Email <input type="email" id="su-email" autocomplete="username" required></label>
+        <label>Password <input type="password" id="su-pass" autocomplete="new-password" minlength="12" required></label>
+        <small>12+ characters with upper, lower, number and symbol.</small>
+        <button type="submit">Sign up</button>
+        <p><a href="#" id="to-signin-1">Back to sign in</a></p>
+      </form>
+
+      <form id="confirm" hidden>
+        <h2>Confirm your email</h2>
+        <label>Code from email <input id="cf-code" inputmode="numeric" autocomplete="one-time-code" required></label>
+        <button type="submit">Confirm</button>
+        <p><a href="#" id="to-signin-2">Back to sign in</a></p>
+      </form>
+    </section>
+
+    <section id="files" hidden>
+      <div class="bar">
+        <span id="who"></span>
+        <button id="signout" type="button">Sign out</button>
+      </div>
+      <form id="upload">
+        <input type="file" id="file" required>
+        <button type="submit">Upload</button>
+      </form>
+      <table>
+        <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+        <tbody id="list"></tbody>
+      </table>
+      <p id="empty" hidden>No files yet.</p>
+    </section>
+  </main>
+</body>
+</html>

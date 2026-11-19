@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One regional copy of the file-hosting backend (S3 + Lambda + HTTP API).
+  Deploy it once per region. Both copies trust the same Cognito user pool.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: cloudfiles
+  StageName:
+    Type: String
+    Description: api-a in the primary region, api-b in the secondary region
+  UserPoolId:
+    Type: String
+  UserPoolRegion:
+    Type: String
+  UserPoolClientId:
+    Type: String
+  ReplicaBucketName:
+    Type: String
+    Default: ""
+    Description: Bucket in the OTHER region to replicate into (leave empty on first deploy)
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Website origin allowed to upload straight to S3 (https://dxxxx.cloudfront.net)
+  MaxUploadBytes:
+    Type: Number
+    Default: 52428800   # 50 MB
+
+Conditions:
+  HasReplica: !Not [!Equals [!Ref ReplicaBucketName, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- storage
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AppName}-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled                 # required for replication
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          - Id: CleanupDeleteMarkersAndUploads
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [POST, GET]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      ReplicationConfiguration: !If
+        - HasReplica
+        - Role: !GetAtt ReplicationRole.Arn
+          Rules:
+            - Id: ReplicateEverything
+              Status: Enabled
+              Priority: 1
+              Filter:
+                Prefix: ""
+              DeleteMarkerReplication:
+                Status: Enabled
+              Destination:
+                Bucket: !Sub "arn:aws:s3:::${ReplicaBucketName}"
+        - !Ref AWS::NoValue
+
+  FilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FilesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${FilesBucket}"
+              - !Sub "arn:aws:s3:::${FilesBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          # CloudFront (via Origin Access Control) may read ONLY the website files.
+          # Wildcard distribution id avoids a circular dependency between stacks;
+          # tighten it to your distribution ARN if you like.
+          - Sid: CloudFrontReadsSiteOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${FilesBucket}/site/*"
+            Condition:
+              StringLike:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: HasReplica
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: replicate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetReplicationConfiguration", "s3:ListBucket"]
+                Resource: !Sub "arn:aws:s3:::${AppName}-${AWS::AccountId}-${AWS::Region}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub "arn:aws:s3:::${AppName}-${AWS::AccountId}-${AWS::Region}/*"
+              - Effect: Allow
+                Action: ["s3:ReplicateObject", "s3:ReplicateDelete", "s3:ReplicateTags"]
+                Resource: !Sub "arn:aws:s3:::${ReplicaBucketName}/*"
+
+  # ---------------------------------------------------------------- compute
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: user-files
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+                Resource: !Sub "arn:aws:s3:::${AppName}-${AWS::AccountId}-${AWS::Region}/uploads/*"
+              - Effect: Allow
+                Action: "s3:ListBucket"
+                Resource: !Sub "arn:aws:s3:::${AppName}-${AWS::AccountId}-${AWS::Region}"
+                Condition:
+                  StringLike:
+                    s3:prefix: "uploads/*"
+
+  FunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-files-${AWS::Region}"
+      RetentionInDays: 14
+
+  FilesFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogs
+    Properties:
+      FunctionName: !Sub "${AppName}-files-${AWS::Region}"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET: !Sub "${AppName}-${AWS::AccountId}-${AWS::Region}"
+          MAX_BYTES: !Ref MaxUploadBytes
+      Code:
+        ZipFile: |
+          import boto3, json, os, re
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+          R = os.environ["AWS_REGION"]
+          B = os.environ["BUCKET"]
+          MAX = int(os.environ["MAX_BYTES"])
+          s3 = boto3.client("s3", region_name=R, endpoint_url=f"https://s3.{R}.amazonaws.com",
+                            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}))
+
+          def reply(code, body):
+              return {"statusCode": code, "body": json.dumps(body),
+                      "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"}}
+
+          def clean(n):
+              n = re.sub(r"[^A-Za-z0-9._ -]", "_", os.path.basename(n or ""))[:128].strip(". ")
+              return n or None
+
+          def handler(event, _):
+              # The owner comes ONLY from the verified token, never from user input.
+              sub = event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]
+              prefix = f"uploads/{sub}/"
+              route = event["routeKey"]
+              if route == "GET /files":
+                  items = s3.list_objects_v2(Bucket=B, Prefix=prefix, MaxKeys=200).get("Contents", [])
+                  return reply(200, [{"name": o["Key"][len(prefix):], "size": o["Size"],
+                                      "modified": o["LastModified"].isoformat()} for o in items])
+              name = clean((event.get("queryStringParameters") or {}).get("name"))
+              if not name:
+                  return reply(400, {"error": "invalid file name"})
+              key = prefix + name
+              try:
+                  if route == "POST /upload-url":
+                      if len(s3.list_objects_v2(Bucket=B, Prefix=prefix, MaxKeys=50).get("Contents", [])) >= 50:
+                          return reply(429, {"error": "file limit reached (50)"})
+                      return reply(200, s3.generate_presigned_post(
+                          B, key, Conditions=[["content-length-range", 1, MAX]], ExpiresIn=300))
+                  if route == "GET /download-url":
+                      s3.head_object(Bucket=B, Key=key)
+                      url = s3.generate_presigned_url("get_object", ExpiresIn=60, Params={
+                          "Bucket": B, "Key": key,
+                          "ResponseContentDisposition": f'attachment; filename="{name}"',
+                          "ResponseContentType": "application/octet-stream"})
+                      return reply(200, {"url": url})
+                  if route == "DELETE /files":
+                      s3.delete_object(Bucket=B, Key=key)
+                      return reply(200, {"deleted": name})
+              except ClientError as e:
+                  if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                      return reply(404, {"error": "not found"})
+                  raise
+              return reply(404, {"error": "unknown route"})
+
+  # -------------------------------------------------------------------- API
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AppName}-api-${AWS::Region}"
+      ProtocolType: HTTP
+
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref Api
+      Name: cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub "https://cognito-idp.${UserPoolRegion}.amazonaws.com/${UserPoolId}"
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !GetAtt FilesFunction.Arn
+
+  RouteList:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /files"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub "integrations/${Integration}"
+  RouteUpload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "POST /upload-url"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub "integrations/${Integration}"
+  RouteDownload:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /download-url"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub "integrations/${Integration}"
+  RouteDelete:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "DELETE /files"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub "integrations/${Integration}"
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [RouteList, RouteUpload, RouteDownload, RouteDelete]
+    Properties:
+      ApiId: !Ref Api
+      StageName: !Ref StageName
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FilesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*"
+
+Outputs:
+  BucketName:
+    Value: !Ref FilesBucket
+  ApiDomain:
+    Value: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"

@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFront front door (deploy in us-east-1). Serves the website from the primary
+  bucket, fails over to the secondary bucket, and routes /api-a/* and /api-b/* to
+  the two regional APIs so the browser only ever talks to one HTTPS origin.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: cloudfiles
+  PrimaryRegion:
+    Type: String
+  SecondaryRegion:
+    Type: String
+  AuthRegion:
+    Type: String
+  PrimaryBucket:
+    Type: String
+  SecondaryBucket:
+    Type: String
+  PrimaryApiDomain:
+    Type: String
+  SecondaryApiDomain:
+    Type: String
+  CachePolicyId:
+    Type: String
+    Description: ID of the AWS-managed Managed-CachingDisabled cache policy (looked up by deploy.sh)
+  OriginRequestPolicyId:
+    Type: String
+    Description: ID of the AWS-managed Managed-AllViewerExceptHostHeader policy (looked up by deploy.sh)
+
+Resources:
+  OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AppName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${AppName}-security-headers"
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer
+            Override: true
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self';
+              connect-src 'self' https://cognito-idp.${AuthRegion}.amazonaws.com
+              https://*.s3.${PrimaryRegion}.amazonaws.com https://*.s3.${SecondaryRegion}.amazonaws.com
+              https://s3.${PrimaryRegion}.amazonaws.com https://s3.${SecondaryRegion}.amazonaws.com;
+              base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AppName} file hosting"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-primary
+            DomainName: !Sub "${PrimaryBucket}.s3.${PrimaryRegion}.amazonaws.com"
+            OriginPath: /site
+            OriginAccessControlId: !GetAtt OAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: s3-secondary
+            DomainName: !Sub "${SecondaryBucket}.s3.${SecondaryRegion}.amazonaws.com"
+            OriginPath: /site
+            OriginAccessControlId: !GetAtt OAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api-a
+            DomainName: !Ref PrimaryApiDomain
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api-b
+            DomainName: !Ref SecondaryApiDomain
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        OriginGroups:
+          Quantity: 1
+          Items:
+            - Id: site-group
+              FailoverCriteria:
+                StatusCodes:
+                  Quantity: 6
+                  Items: [403, 404, 500, 502, 503, 504]
+              Members:
+                Quantity: 2
+                Items:
+                  - OriginId: s3-primary
+                  - OriginId: s3-secondary
+        DefaultCacheBehavior:
+          TargetOriginId: site-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: !Ref CachePolicyId
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+        CacheBehaviors:
+          - PathPattern: /api-a/*
+            TargetOriginId: api-a
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: !Ref CachePolicyId
+            OriginRequestPolicyId: !Ref OriginRequestPolicyId
+            ResponseHeadersPolicyId: !Ref SecurityHeaders
+          - PathPattern: /api-b/*
+            TargetOriginId: api-b
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: !Ref CachePolicyId
+            OriginRequestPolicyId: !Ref OriginRequestPolicyId
+            ResponseHeadersPolicyId: !Ref SecurityHeaders
+
+Outputs:
+  DomainName:
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution

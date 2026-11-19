@@ -1,0 +1,1 @@
+upload files to cloudfront, then do "chmod +x deploy.sh destroy.sh && ./deploy.sh" to start website up. do "./destroy.sh --purge" to stop website and remove files from aws
