@@ -1,3 +1,0 @@
-﻿# Cloud-Computing-Project
-
-This repository contains the source code for the static website hosted by my public S3 bucket
